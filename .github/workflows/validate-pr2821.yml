@@ -1,0 +1,90 @@
+name: Validate batch file serialization safety
+
+on:
+  push:
+    branches: [codex/validate-pr2821-20261020]
+
+permissions:
+  contents: read
+
+jobs:
+  batch-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.9"
+            sdk: minimum
+            constraints: openai==2.0.0 pydantic==2.8.0
+          - python: "3.13"
+            sdk: latest-compatible
+            constraints: ""
+    defaults:
+      run:
+        shell: bash
+    env:
+      INSTRUCTOR_ENV: CI
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify PR runtime and test sources
+        run: git diff --exit-code 7ceb9f89d3fc3f9ef03b9a743f3d1c2729973668 -- instructor tests pyproject.toml uv.lock
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install -e '.[dev]' 'ruff==0.9.9' ${{ matrix.constraints }}
+          python -m pip check
+          python - <<'PY'
+          import sys, openai, pydantic, instructor
+          print(sys.version)
+          print('OpenAI', openai.__version__, 'Pydantic', pydantic.__version__)
+          print('Source', instructor.__file__)
+          PY
+      - name: Lint and format the changed Python files
+        run: |
+          ruff check instructor/batch/processor.py tests/test_batch_processor_coverage.py
+          ruff format --check instructor/batch/processor.py tests/test_batch_processor_coverage.py
+      - name: Run the batch processor suite
+        run: python -m pytest tests/test_batch_processor_coverage.py -q --junitxml=/tmp/pr2821-current.xml 2>&1 | tee /tmp/pr2821-current.log
+      - name: Verify both regressions fail against original runtime
+        run: |
+          git show 035c77b7b04dbbf70ae4457eb102038907b5a2a4:instructor/batch/processor.py > instructor/batch/processor.py
+          set +e
+          python -m pytest tests/test_batch_processor_coverage.py -q -k does_not_write_partial_output_on_serialization_error --junitxml=/tmp/pr2821-before.xml > /tmp/pr2821-before.log 2>&1
+          baseline_status=$?
+          set -e
+          cat /tmp/pr2821-before.log
+          python - "$baseline_status" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse('/tmp/pr2821-before.xml').getroot()
+          assert int(sys.argv[1]) == 1, 'Expected regression assertions to fail'
+          assert len(root.findall('.//testcase')) == 2
+          assert len(root.findall('.//failure')) == 2
+          assert not root.findall('.//error')
+          PY
+      - name: Restore and repeat the fixed regressions
+        run: |
+          git restore --source=HEAD -- instructor/batch/processor.py
+          git diff --exit-code -- instructor/batch/processor.py
+          python -m pytest tests/test_batch_processor_coverage.py -q -k does_not_write_partial_output_on_serialization_error --junitxml=/tmp/pr2821-after.xml 2>&1 | tee /tmp/pr2821-after.log
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('/tmp/pr2821-after.xml').getroot()
+          assert len(root.findall('.//testcase')) == 2
+          assert not root.findall('.//failure')
+          assert not root.findall('.//error')
+          PY
+      - name: Save validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2821-${{ matrix.python }}-${{ matrix.sdk }}
+          path: /tmp/pr2821-*
+          if-no-files-found: ignore
